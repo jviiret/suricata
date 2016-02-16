@@ -1828,7 +1828,7 @@ static int InitSignalHandler(SCInstance *suri)
     /* Try to get user/group to run suricata as if
        command line as not decide of that */
     if (suri->do_setuid == FALSE && suri->do_setgid == FALSE) {
-        char *id;
+        const char *id;
         if (ConfGet("run-as.user", &id) == 1) {
             suri->do_setuid = TRUE;
             suri->user_name = id;
