@@ -47,6 +47,9 @@
 #include "util-unittest.h"
 #include "util-print.h"
 #include "util-pool.h"
+#include "util-hash.h"
+#include "util-hash-lookup3.h"
+#include "util-memcmp.h"
 
 #include "conf.h"
 #include "app-layer.h"
@@ -58,6 +61,10 @@
 #include "app-layer-protos.h"
 #include "app-layer-parser.h"
 #include "util-pages.h"
+
+#ifdef BUILD_HYPERSCAN
+#include <hs.h>
+#endif
 
 #define PARSE_CAPTURE_REGEX "\\(\\?P\\<([A-z]+)\\_([A-z0-9_]+)\\>"
 #define PARSE_REGEX         "(?<!\\\\)/(.*(?<!(?<!\\\\)\\\\))/([^\"]*)"
@@ -75,6 +82,12 @@ static pcre_extra *parse_capture_regex_study;
 
 #ifdef PCRE_HAVE_JIT
 static int pcre_use_jit = 1;
+#endif
+
+#ifdef BUILD_HYPERSCAN
+static int pcre_hyperscan_prefilter = 0;
+static HashTable *g_hs_db_table = NULL;
+#define HYPERSCAN_PCRE_HASH_TABLE_SIZE 1000
 #endif
 
 int DetectPcreMatch (ThreadVars *, DetectEngineThreadCtx *, Packet *, Signature *, SigMatch *);
@@ -127,6 +140,21 @@ void DetectPcreRegister (void)
         }
     }
 
+    int bool_val = 0;
+    if (ConfGetBool("pcre.hyperscan-prefilter", &bool_val)) {
+#ifdef BUILD_HYPERSCAN
+        pcre_hyperscan_prefilter = bool_val;
+        SCLogInfo("prefiltering PCRE with Hyperscan %s",
+                  bool_val ? "enabled" : "disabled");
+#else
+        if (bool_val != 0) {
+            SCLogError(SC_ERR_FATAL, "pcre.hyperscan-prefilter: only available "
+                                     "when built with Hyperscan");
+            exit(EXIT_FAILURE);
+        }
+#endif
+    }
+
     DetectSetupParseRegexes(PARSE_REGEX, &parse_regex, &parse_regex_study);
 
     /* setup the capture regex, as it needs PCRE_UNGREEDY we do it manually */
@@ -156,6 +184,110 @@ void DetectPcreRegister (void)
     DetectParseRegexAddToFreeList(parse_capture_regex, parse_capture_regex_study);
     return;
 }
+
+/**
+ * \brief Clean up global memory used by all instances.
+ */
+void DetectPcreGlobalCleanup(void)
+{
+#ifdef BUILD_HYPERSCAN
+    if (g_hs_db_table != NULL) {
+        SCLogInfo("Clearing Hyperscan database cache");
+        HashTableFree(g_hs_db_table);
+        g_hs_db_table = NULL;
+    }
+#endif
+}
+
+#ifdef BUILD_HYPERSCAN
+
+#define DETECT_PCRE_HS_PREFILTER        0x00001
+
+/**
+ * \brief Structure wrapping a regex and its built Hyperscan database, used for
+ * de-duplication.
+ */
+typedef struct HyperscanPcreDatabase_ {
+    char *re; /* Regex string */
+    unsigned int re_len; /* Length of regex string */
+    unsigned int hs_flags; /* Hyperscan flags */
+    uint16_t scan_flags; /* Scan flags (i.e. prefiltering or not). */
+
+    /* Built database, or NULL if Hyperscan cannot build this regex. */
+    hs_database_t *db;
+
+    /* Reference count: number of DetectPcre instances using this
+     * database. */
+    uint32_t ref_cnt;
+} HyperscanPcreDatabase;
+
+typedef struct HyperscanMatchContext_ {
+    int matched;
+} HyperscanMatchContext;
+
+static int PcreHyperscanCallback(unsigned int id, unsigned long long from,
+                                 unsigned long long to, unsigned int flags,
+                                 void *ctx)
+{
+    SCLogDebug("Hyperscan PCRE match at %" PRIu64, (uint64_t)to);
+    HyperscanMatchContext *hs_ctx = ctx;
+    hs_ctx->matched = 1;
+    return 1; /* halt matching */
+}
+
+typedef enum HyperscanVerdict_ {
+    HS_NO_MATCH,
+    HS_MATCH_NO_CONFIRM,
+    HS_MATCH_CONFIRM
+} HyperscanVerdict;
+
+/**
+ * \brief Prefilter a regex using Hyperscan. Returns a HyperscanVerdict
+ * indicating whether a match occurred and whether it needs to be confirmed
+ * with pcre_exec().
+ */
+static HyperscanVerdict DetectPcreHyperscanPrefilter(DetectEngineThreadCtx *det_ctx,
+                             const DetectPcreData *pe, const uint8_t *ptr,
+                             uint16_t len)
+{
+    HyperscanMatchContext hsctx;
+    hsctx.matched = 0;
+
+    HyperscanPcreDatabase *hs = pe->hs_db;
+    hs_scratch_t *scratch = det_ctx->hs_pcre_scratch;
+
+    hs_error_t err = hs_scan(hs->db, (const char *)ptr, len, 0, scratch,
+                             PcreHyperscanCallback, &hsctx);
+    if (err != HS_SUCCESS && err != HS_SCAN_TERMINATED) {
+        /* A fatal error occurred: fall back to PCRE. */
+        SCLogDebug("hs_scan returned error %d\n", err);
+        return HS_MATCH_CONFIRM;
+    }
+
+    if (!hsctx.matched) {
+        SCLogDebug("Hyperscan did not match");
+        return HS_NO_MATCH;
+    }
+
+    SCLogDebug("Hyperscan did match");
+
+    if (hs->scan_flags & DETECT_PCRE_HS_PREFILTER) {
+        SCLogDebug("Hyperscan prefiltering; must confirm");
+        return HS_MATCH_CONFIRM;
+    }
+
+    static const uint16_t must_confirm_flags =
+        DETECT_PCRE_RELATIVE | DETECT_PCRE_CAPTURE_PKT |
+        DETECT_PCRE_CAPTURE_FLOW | DETECT_PCRE_RELATIVE_NEXT;
+    if (pe->flags & must_confirm_flags) {
+        SCLogDebug("Hyperscan match needs confirm due to capturing/relative");
+        return HS_MATCH_CONFIRM;
+    }
+
+    return HS_MATCH_NO_CONFIRM;
+}
+
+#endif /* BUILD_HYPERSCAN */
 
 /**
  * \brief Match a regex on a single payload.
@@ -198,11 +330,36 @@ int DetectPcrePayloadMatch(DetectEngineThreadCtx *det_ctx, Signature *s,
         start_offset = (payload + det_ctx->pcre_match_start_offset - ptr);
     }
 
+#ifdef BUILD_HYPERSCAN
+    if (pe->hs_db != NULL) {
+        HyperscanVerdict verdict = DetectPcreHyperscanPrefilter(det_ctx, pe, ptr, len);
+        switch (verdict) {
+        case HS_NO_MATCH:
+            /* Hyperscan did not match on this input, and since it will return
+             * a superset of PCRE's matches, PCRE will not match either. */
+            goto pcre_no_match;
+        case HS_MATCH_NO_CONFIRM:
+            /* Hyperscan matched and we know that no confirmation is necessary,
+             * so we just process the result. */
+            ret = pe->flags & DETECT_PCRE_NEGATE ? 0 : 1;
+            goto pcre_done;
+        case HS_MATCH_CONFIRM:
+            SCLogDebug("Confirming match with pcre_exec()");
+            break;
+        }
+    } else {
+        SCLogDebug("No Hyperscan prefilter");
+    }
+#endif /* BUILD_HYPERSCAN */
+
     /* run the actual pcre detection */
     ret = pcre_exec(pe->re, pe->sd, (char *)ptr, len, start_offset, 0, ov, MAX_SUBSTRINGS);
     SCLogDebug("ret %d (negating %s)", ret, (pe->flags & DETECT_PCRE_NEGATE) ? "set" : "not set");
 
     if (ret == PCRE_ERROR_NOMATCH) {
+#ifdef BUILD_HYPERSCAN
+pcre_no_match:
+#endif
         if (pe->flags & DETECT_PCRE_NEGATE) {
             /* regex didn't match with negate option means we
              * consider it a match */
@@ -254,6 +411,10 @@ int DetectPcrePayloadMatch(DetectEngineThreadCtx *det_ctx, Signature *s,
         SCLogDebug("pcre had matching error");
         ret = 0;
     }
+
+#ifdef BUILD_HYPERSCAN
+pcre_done:
+#endif
     SCReturnInt(ret);
 }
 
@@ -285,6 +446,165 @@ static int DetectPcreHasUpperCase(const char *re)
 
     return 0;
 }
+
+#ifdef BUILD_HYPERSCAN
+
+static uint32_t HyperscanPcreHash(HashTable *ht, void *data, uint16_t len)
+{
+    const HyperscanPcreDatabase *pd = data;
+    uint32_t hash = 0;
+    hash = hashlittle_safe(pd->re, pd->re_len, hash);
+    hash = hashlittle_safe(&pd->hs_flags, sizeof(pd->hs_flags), hash);
+    hash %= ht->array_size;
+    return hash;
+}
+
+static char HyperscanPcreCompare(void *data1, uint16_t len1, void *data2,
+                                 uint16_t len2)
+{
+    const HyperscanPcreDatabase *p1 = data1;
+    const HyperscanPcreDatabase *p2 = data2;
+    if (p1->hs_flags != p2->hs_flags) {
+        return 0;
+    }
+    if (p1->re_len != p2->re_len) {
+        return 0;
+    }
+    if (SCMemcmp(p1->re, p2->re, p1->re_len) != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static void HyperscanPcreFree(HyperscanPcreDatabase *pd)
+{
+    BUG_ON(pd->ref_cnt != 0);
+
+    free(pd->re);
+    hs_free_database(pd->db);
+    SCFree(pd);
+}
+
+static void HyperscanPcreTableFree(void *data)
+{
+    /* Stub function handed to hash table; actual freeing of
+     * HyperscanPcreDatabase structures is done in DetectPcre destruction when
+     * the ref_cnt drops to zero. */
+}
+
+static int DetectPcreBuildHyperscan(DetectEngineCtx *de_ctx, DetectPcreData *pd,
+                                    const char *re, int pcre_opts)
+{
+    SCLogDebug("Building regex: %s", re);
+
+    int supported_pcre_opts =
+        PCRE_CASELESS | PCRE_DOTALL | PCRE_MULTILINE | PCRE_UNGREEDY;
+    if (pcre_opts & ~supported_pcre_opts) {
+        SCLogDebug("Can't prefilter: pcre '%s' unsupported flags=%d", re,
+                   pcre_opts & ~supported_pcre_opts);
+        return 0;
+    }
+
+    int hs_flags = HS_FLAG_ALLOWEMPTY;
+    if (pcre_opts & PCRE_CASELESS) {
+        hs_flags |= HS_FLAG_CASELESS;
+    }
+    if (pcre_opts & PCRE_DOTALL) {
+        hs_flags |= HS_FLAG_DOTALL;
+    }
+    if (pcre_opts & PCRE_MULTILINE) {
+        hs_flags |= HS_FLAG_MULTILINE;
+    }
+
+    if (g_hs_db_table == NULL) {
+        g_hs_db_table = HashTableInit(HYPERSCAN_PCRE_HASH_TABLE_SIZE,
+                                      HyperscanPcreHash, HyperscanPcreCompare,
+                                      HyperscanPcreTableFree);
+        if (g_hs_db_table == NULL) {
+            return 1;
+        }
+    }
+
+    HyperscanPcreDatabase *p = SCMalloc(sizeof(HyperscanPcreDatabase));
+    assert(p != NULL);
+    memset(p, 0, sizeof(*p));
+    p->re = SCStrdup(re);
+    if (p->re == NULL) {
+        SCFree(p);
+        return 1;
+    }
+    p->re_len = strlen(re);
+    p->hs_flags = hs_flags;
+    p->db = NULL;
+
+    HyperscanPcreDatabase *p_cached = HashTableLookup(g_hs_db_table, p, 1);
+    if (p_cached != NULL) {
+        p_cached->ref_cnt++;
+        pd->hs_db = p_cached;
+        HyperscanPcreFree(p);
+        return 0;
+    }
+
+    hs_error_t err;
+    hs_compile_error_t *compile_error = NULL;
+    hs_database_t *db = NULL;
+
+    /* First, we attempt to compile the pattern with full Hyperscan support. */
+    err = hs_compile(re, hs_flags, HS_MODE_BLOCK, NULL, &db, &compile_error);
+    if (err != HS_SUCCESS) {
+        if (compile_error) {
+            SCLogDebug("Full compile failed: %s", compile_error->message);
+            hs_free_compile_error(compile_error);
+            compile_error = NULL;
+        }
+    }
+
+    /* If the first attempt failed, we use Hyperscan's prefiltering support to
+     * attempt to build a simplified version of the pattern that will return a
+     * superset of the matches that PCRE would return. */
+    if (!db) {
+        hs_flags |= HS_FLAG_PREFILTER;
+        err = hs_compile(re, hs_flags, HS_MODE_BLOCK, NULL, &db, &compile_error);
+        if (err != HS_SUCCESS) {
+            if (compile_error) {
+                SCLogDebug("Prefilter compile failed: %s", compile_error->message);
+                hs_free_compile_error(compile_error);
+            }
+        }
+    }
+
+    if (!db) {
+        SCLogInfo("Hyperscan could not prefilter regex: %s (opts=%d)", re,
+                  pcre_opts);
+        pd->hs_db = NULL;
+        HyperscanPcreFree(p);
+        return 0;
+    }
+
+    p->scan_flags = 0;
+    if (hs_flags & HS_FLAG_PREFILTER) {
+        p->scan_flags |= DETECT_PCRE_HS_PREFILTER;
+    }
+
+    // Write into the cache.
+    p->ref_cnt = 1;
+    p->db = db;
+    HashTableAdd(g_hs_db_table, p, 1);
+
+    pd->hs_db = p;
+
+    hs_scratch_t *scratch = de_ctx->hs_pcre_global_scratch;
+    err = hs_alloc_scratch(db, &scratch);
+    if (err != HS_SUCCESS) {
+        SCLogError(SC_ERR_FATAL, "hs_alloc_scratch failed");
+        exit(EXIT_FAILURE);
+    }
+    de_ctx->hs_pcre_global_scratch = scratch;
+
+    return 0;
+}
+
+#endif /* BUILD_HYPERSCAN */
 
 static DetectPcreData *DetectPcreParse (DetectEngineCtx *de_ctx, char *regexstr, int *sm_list)
 {
@@ -567,6 +887,14 @@ static DetectPcreData *DetectPcreParse (DetectEngineCtx *de_ctx, char *regexstr,
         goto error;
     }
 
+#ifdef BUILD_HYPERSCAN
+    if (pcre_hyperscan_prefilter) {
+        if (DetectPcreBuildHyperscan(de_ctx, pd, re, opts) != 0) {
+            goto error;
+        }
+    }
+#endif /* BUILD_HYPERSCAN */
+
     return pd;
 
 error:
@@ -800,6 +1128,17 @@ void DetectPcreFree(void *ptr)
         pcre_free(pd->re);
     if (pd->sd != NULL)
         pcre_free_study(pd->sd);
+#ifdef BUILD_HYPERSCAN
+    if (pd->hs_db != NULL) {
+        HyperscanPcreDatabase *hs = pd->hs_db;
+        BUG_ON(hs->ref_cnt == 0);
+        hs->ref_cnt--;
+        if (hs->ref_cnt == 0) {
+            HashTableRemove(g_hs_db_table, hs, 1);
+            HyperscanPcreFree(hs);
+        }
+    }
+#endif
 
     SCFree(pd);
     return;

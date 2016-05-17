@@ -766,6 +766,12 @@ typedef struct DetectEngineCtx_ {
      *  \todo we only need this at init, so perhaps this
      *        can move to a DetectEngineCtx 'init' struct */
     DetectMpmAppLayerKeyword *app_mpms;
+
+#ifdef BUILD_HYPERSCAN
+    /** Scratch space used for Hyperscan PCRE prefiltering. */
+    void *hs_pcre_global_scratch;
+#endif
+
 } DetectEngineCtx;
 
 /* Engine groups profiles (low, medium, high, custom) */
@@ -919,6 +925,11 @@ typedef struct DetectEngineThreadCtx_ {
     /** SPM thread context used for scanning. This has been cloned from the
      * prototype held by DetectEngineCtx. */
     SpmThreadCtx *spm_thread_ctx;
+
+#ifdef BUILD_HYPERSCAN
+    /** Scratch space used for Hyperscan PCRE prefiltering. */
+    void *hs_pcre_scratch;
+#endif
 
     /** ip only rules ctx */
     DetectEngineIPOnlyThreadCtx io_ctx;

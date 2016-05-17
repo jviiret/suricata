@@ -41,6 +41,9 @@ typedef struct DetectPcreData_ {
     uint16_t flags;
     uint16_t capidx;
     char *capname;
+#ifdef BUILD_HYPERSCAN
+    void *hs_db;
+#endif
 } DetectPcreData;
 
 /* prototypes */
@@ -49,6 +52,7 @@ int DetectPcrePacketPayloadMatch(DetectEngineThreadCtx *, Packet *, Signature *,
 int DetectPcrePayloadDoMatch(DetectEngineThreadCtx *, Signature *, SigMatch *,
                              Packet *, uint8_t *, uint16_t);
 void DetectPcreRegister (void);
+void DetectPcreGlobalCleanup(void);
 
 #endif /* __DETECT_PCRE_H__ */
 

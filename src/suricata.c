@@ -63,6 +63,7 @@
 #include "detect-engine-address.h"
 #include "detect-engine-port.h"
 #include "detect-engine-mpm.h"
+#include "detect-pcre.h"
 
 #include "tm-queuehandlers.h"
 #include "tm-queues.h"
@@ -2730,6 +2731,8 @@ int main(int argc, char **argv)
     AppLayerDeSetup();
 
     TagDestroyCtx();
+
+    DetectPcreGlobalCleanup();
 
     LiveDeviceListClean();
     RunModeShutDown();

@@ -82,6 +82,10 @@
 
 #include "reputation.h"
 
+#ifdef BUILD_HYPERSCAN
+#include <hs.h>
+#endif
+
 #define DETECT_ENGINE_DEFAULT_INSPECTION_RECURSION_LIMIT 3000
 
 static uint32_t detect_engine_ctx_id = 1;
@@ -699,6 +703,10 @@ void DetectEngineCtxFree(DetectEngineCtx *de_ctx)
     }
 #endif
 
+#ifdef BUILD_HYPERSCAN
+    hs_free_scratch(de_ctx->hs_pcre_global_scratch);
+#endif
+
     /* Normally the hashes are freed elsewhere, but
      * to be sure look at them again here.
      */
@@ -1282,6 +1290,18 @@ static TmEcode ThreadCtxDoInit (DetectEngineCtx *de_ctx, DetectEngineThreadCtx *
         det_ctx->base64_decoded_len = 0;
     }
 
+#ifdef BUILD_HYPERSCAN
+    /* Scratch space for Hyperscan PCRE prefiltering. */
+    if (de_ctx->hs_pcre_global_scratch != NULL) {
+        hs_scratch_t *scratch = NULL;
+        hs_error_t err = hs_clone_scratch(de_ctx->hs_pcre_global_scratch, &scratch);
+        if (err != HS_SUCCESS) {
+            return TM_ECODE_FAILED;
+        }
+        det_ctx->hs_pcre_scratch = scratch;
+    }
+#endif
+
     DetectEngineThreadCtxInitKeywords(de_ctx, det_ctx);
 #ifdef PROFILING
     SCProfilingRuleThreadSetup(de_ctx->profile_ctx, det_ctx);
@@ -1438,6 +1458,10 @@ void DetectEngineThreadCtxFree(DetectEngineThreadCtx *det_ctx)
     SCProfilingRuleThreadCleanup(det_ctx);
     SCProfilingKeywordThreadCleanup(det_ctx);
     SCProfilingSghThreadCleanup(det_ctx);
+#endif
+
+#ifdef BUILD_HYPERSCAN
+    hs_free_scratch(det_ctx->hs_pcre_scratch);
 #endif
 
     DetectEngineIPOnlyThreadDeinit(&det_ctx->io_ctx);

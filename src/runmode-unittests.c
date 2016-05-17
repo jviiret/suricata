@@ -53,6 +53,7 @@
 #include "detect-engine-modbus.h"
 #include "detect-engine-filedata-smtp.h"
 #include "detect-fast-pattern.h"
+#include "detect-pcre.h"
 #include "flow.h"
 #include "flow-timeout.h"
 #include "flow-manager.h"
@@ -296,6 +297,7 @@ void RunUnittests(int list_unittests, char *regex_arg)
         uint32_t failed = UtRunTests(regex_arg);
         PacketPoolDestroy();
         UtCleanup();
+        DetectPcreGlobalCleanup();
 #ifdef BUILD_HYPERSCAN
         MpmHSGlobalCleanup();
 #endif

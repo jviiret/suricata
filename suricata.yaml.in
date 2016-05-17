@@ -995,6 +995,9 @@ engine-analysis:
 pcre:
   match-limit: 3500
   match-limit-recursion: 1500
+  # Hyperscan can be used to prefilter PCRE matches, if Suricata is built with
+  # Hyperscan support.
+  hyperscan-prefilter: no
 
 ##
 ## Advanced Traffic Tracking and Reconstruction Settings
